@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>POC Lotes de Veículos — Resultado Consolidado</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Resultado Consolidado dos Lotes</h1>
+
+      <section class="controls">
+        <label for="lote-select">Lote:</label>
+        <select id="lote-select" aria-label="Selecionar lote">
+          <option value="">Carregando...</option>
+        </select>
+        <button id="refresh" type="button">Atualizar</button>
+      </section>
+
+      <p id="status" role="status" aria-live="polite"></p>
+
+      <table id="tabela" hidden>
+        <caption class="sr-only">Veículos do lote selecionado</caption>
+        <thead>
+          <tr>
+            <th scope="col">Lote</th>
+            <th scope="col">Placa</th>
+            <th scope="col">Ano Fabricação</th>
+            <th scope="col">Modelo</th>
+            <th scope="col">Fabricante</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

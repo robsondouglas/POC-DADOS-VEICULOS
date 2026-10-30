@@ -1,0 +1,9 @@
+{
+  "name": "poc-dados-2",
+  "version": "1.0.0",
+  "description": "Pipeline de ingestão de dados",
+  "private": true,
+  "devDependencies": {
+    "serverless": "^4.4.0"
+  }
+}

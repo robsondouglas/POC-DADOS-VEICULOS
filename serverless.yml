@@ -1,0 +1,487 @@
+# "org" ensures this Service is used with the correct Serverless Framework Access Key.
+org: agendainteligente
+service: poc-lotes-veiculos
+
+frameworkVersion: "4"
+
+provider:
+  name: aws
+  runtime: python3.12
+  region: ${opt:region, 'sa-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 512
+  timeout: 30
+  environment:
+    TABLE_NAME: ${self:custom.tableName}
+    BUCKET_INGESTAO: ${self:custom.ingestaoBucket}
+    BUCKET_SOR: ${self:custom.sorBucket}
+    BUCKET_SOT: ${self:custom.sotBucket}
+    KINESIS_STREAM: ${self:custom.kinesisStream}
+    SNS_RESULTADO_ARN: !Ref SnsResultadoSla
+    SCHEDULER_GROUP: ${self:custom.schedulerGroup}
+
+custom:
+  # Stage em minúsculas para nomes de bucket S3 (não aceita maiúsculas).
+  # Sobrescreva com: --param="bucketStage=<valor-minusculo>"
+  bucketStage: ${param:bucketStage, 'hml'}
+  tableName: ${self:service}-${self:provider.stage}-lotes
+  ingestaoBucket: ${self:service}-${self:custom.bucketStage}-ingestao
+  sorBucket: ${self:service}-${self:custom.bucketStage}-sor
+  sotBucket: ${self:service}-${self:custom.bucketStage}-sot
+  siteBucket: ${self:service}-${self:custom.bucketStage}-site
+  kinesisStream: ${self:service}-${self:provider.stage}-stream
+  schedulerGroup: ${self:service}-${self:provider.stage}-sla
+  pythonRequirements:
+    dockerizePip: false
+    slim: true
+    layer: true
+    strip: false
+    # Sem docker-in-docker: forçamos o pip a baixar wheels pré-compilados
+    # manylinux (glibc, compatíveis com o runtime Lambda), proibindo build do
+    # source. Isto resolve o erro de compilar pyarrow e o download de wheels musl.
+    pipCmdExtraArgs:
+      - "--platform manylinux2014_x86_64"
+      - "--implementation cp"
+      - "--python-version 3.12"
+      - "--abi cp312"
+      - "--only-binary=:all:"
+    noDeploy:
+      - boto3
+      - botocore
+      - pytest
+      - moto
+      - ruff
+    # Força o uso do requirements.txt da raiz. Sem isto, o plugin detecta o
+    # uv.lock do projeto (que não contém a dep de runtime) e gera um layer
+    # vazio via `uv export`.
+    useUv: false
+    fileName: requirements.txt
+    # Desativa o cache para não reusar artefatos antigos durante a depuração.
+    useStaticCache: false
+    useDownloadCache: false
+    invalidateCaches: true
+package:
+  patterns:
+    - "!**"
+    - "src/**"
+
+functions:
+  ingestao:
+    handler: src/ingestao/handler.handler
+    environment:
+      CARGA_SOT_FUNCTION: ${self:service}-${self:provider.stage}-cargaSot
+      SCHEDULER_TARGET_LAMBDA_ARN: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${self:service}-${self:provider.stage}-expiracao"
+      SCHEDULER_ROLE_ARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/${self:service}-${self:provider.stage}-scheduler-invoke"
+    layers:
+      - Ref: PythonRequirementsLambdaLayer
+    events:
+      - sqs:
+          arn: !GetAtt IngestaoQueue.Arn
+          batchSize: 10
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+          - dynamodb:GetItem
+        Resource: !GetAtt LotesTable.Arn
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+        Resource: !Sub "arn:aws:s3:::${self:custom.ingestaoBucket}/*"
+      - Effect: Allow
+        Action:
+          - scheduler:CreateSchedule
+          - scheduler:DeleteSchedule
+        Resource: "*"
+      - Effect: Allow
+        Action: iam:PassRole
+        Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${self:service}-${self:provider.stage}-scheduler-invoke"
+      - Effect: Allow
+        Action: lambda:InvokeFunction
+        Resource: !Sub "arn:aws:lambda:${self:provider.region}:*:function:${self:service}-${self:provider.stage}-cargaSot"
+
+  expiracao:
+    handler: src/expiracao/handler.handler
+    name: ${self:service}-${self:provider.stage}-expiracao
+    layers:
+      - Ref: PythonRequirementsLambdaLayer
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+        Resource: !GetAtt LotesTable.Arn
+      - Effect: Allow
+        Action: sns:Publish
+        Resource: !Ref SnsResultadoSla
+
+  api:
+    handler: src/api/handler.handler
+    timeout: 29
+    layers:
+      - Ref: PythonRequirementsLambdaLayer
+    events:
+      - httpApi:
+          path: /api/lotes
+          method: get
+      - httpApi:
+          path: /api/lotes/{lote}
+          method: get
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:ListBucket
+        Resource:
+          - !Sub "arn:aws:s3:::${self:custom.sotBucket}"
+          - !Sub "arn:aws:s3:::${self:custom.sotBucket}/*"
+
+  sorConsumer:
+    handler: src/sor_consumer/handler.handler
+    layers:
+      - Ref: PythonRequirementsLambdaLayer
+    events:
+      - stream:
+          type: kinesis
+          arn: !GetAtt DataStream.Arn
+          batchSize: 100
+          startingPosition: LATEST
+          maximumRetryAttempts: 3
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+        Resource: !Sub "arn:aws:s3:::${self:custom.sorBucket}/*"
+
+  cargaSot:
+    handler: src/carga_sot/handler.handler
+    name: ${self:service}-${self:provider.stage}-cargaSot
+    timeout: 120
+    layers:
+      - Ref: PythonRequirementsLambdaLayer
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+          - dynamodb:UpdateItem
+        Resource: !GetAtt LotesTable.Arn
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:ListBucket
+        Resource:
+          - !Sub "arn:aws:s3:::${self:custom.sorBucket}"
+          - !Sub "arn:aws:s3:::${self:custom.sorBucket}/*"
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+        Resource: !Sub "arn:aws:s3:::${self:custom.sotBucket}/*"
+      - Effect: Allow
+        Action:
+          - scheduler:DeleteSchedule
+        Resource: "*"
+      - Effect: Allow
+        Action: sns:Publish
+        Resource: !Ref SnsResultadoSla
+
+resources:
+  Resources:
+    # ---------- DynamoDB Single Table ----------
+    LotesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.tableName}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+        StreamSpecification:
+          StreamViewType: NEW_IMAGE
+
+    # ---------- Kinesis Data Stream (particionado por lote) ----------
+    DataStream:
+      Type: AWS::Kinesis::Stream
+      Properties:
+        Name: ${self:custom.kinesisStream}
+        StreamModeDetails:
+          StreamMode: ON_DEMAND
+
+    # ---------- EventBridge Pipe: DynamoDB Stream -> Kinesis ----------
+    # Filtra o registro de controle (SK = '0000000') na origem.
+    PipeRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: pipes.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: PipeDdbToKinesis
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:DescribeStream
+                    - dynamodb:GetRecords
+                    - dynamodb:GetShardIterator
+                    - dynamodb:ListStreams
+                  Resource: !GetAtt LotesTable.StreamArn
+                - Effect: Allow
+                  Action:
+                    - kinesis:PutRecord
+                    - kinesis:PutRecords
+                  Resource: !GetAtt DataStream.Arn
+
+    DdbToKinesisPipe:
+      Type: AWS::Pipes::Pipe
+      Properties:
+        Name: ${self:service}-${self:provider.stage}-ddb-kinesis
+        RoleArn: !GetAtt PipeRole.Arn
+        Source: !GetAtt LotesTable.StreamArn
+        SourceParameters:
+          DynamoDBStreamParameters:
+            StartingPosition: LATEST
+            BatchSize: 100
+          FilterCriteria:
+            Filters:
+              # Propaga apenas registros cuja SK != '0000000' (exclui controle)
+              - Pattern: '{"dynamodb":{"Keys":{"SK":{"S":[{"anything-but":["0000000"]}]}}}}'
+        Target: !GetAtt DataStream.Arn
+        TargetParameters:
+          KinesisStreamParameters:
+            PartitionKey: "$.dynamodb.Keys.PK.S"
+
+    # ---------- SQS de ingestao + DLQ ----------
+    IngestaoDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-ingestao-dlq
+        MessageRetentionPeriod: 1209600 # 14 dias
+
+    IngestaoQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}-ingestao
+        VisibilityTimeout: 180 # 6x o timeout da Lambda (30s)
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt IngestaoDLQ.Arn
+          maxReceiveCount: 3
+
+    # ---------- SNS de ingestao (notificacao do bucket) ----------
+    SnsIngestao:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${self:provider.stage}-ingestao
+
+    SnsIngestaoSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref SnsIngestao
+        Protocol: sqs
+        Endpoint: !GetAtt IngestaoQueue.Arn
+        RawMessageDelivery: false
+
+    # Permite o SNS publicar na SQS
+    IngestaoQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref IngestaoQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt IngestaoQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref SnsIngestao
+
+    # ---------- S3 Buckets ----------
+    IngestaoBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: SnsIngestaoTopicPolicy
+      Properties:
+        BucketName: ${self:custom.ingestaoBucket}
+        NotificationConfiguration:
+          TopicConfigurations:
+            - Event: s3:ObjectCreated:*
+              Topic: !Ref SnsIngestao
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+    # Permite o S3 publicar no SNS de ingestao
+    SnsIngestaoTopicPolicy:
+      Type: AWS::SNS::TopicPolicy
+      Properties:
+        Topics:
+          - !Ref SnsIngestao
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: s3.amazonaws.com
+              Action: sns:Publish
+              Resource: !Ref SnsIngestao
+              Condition:
+                ArnLike:
+                  aws:SourceArn: !Sub "arn:aws:s3:::${self:custom.ingestaoBucket}"
+
+    SorBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.sorBucket}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        LifecycleConfiguration:
+          Rules:
+            - Id: ExpiraSorCurto
+              Status: Enabled
+              ExpirationInDays: 1
+
+    SotBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.sotBucket}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+    # ---------- SNS de resultado do SLA ----------
+    SnsResultadoSla:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${self:provider.stage}-resultado-sla
+
+    # ---------- IAM role usada pelo EventBridge Scheduler para invocar a Lambda de expiracao ----------
+    SchedulerInvokeRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:service}-${self:provider.stage}-scheduler-invoke
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: scheduler.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: InvokeExpiracaoLambda
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${self:service}-${self:provider.stage}-expiracao"
+
+    # ---------- Scheduler Group dedicado ----------
+    SlaSchedulerGroup:
+      Type: AWS::Scheduler::ScheduleGroup
+      Properties:
+        Name: ${self:custom.schedulerGroup}
+
+    # ---------- Visualizacao: site estatico + CloudFront ----------
+    SiteBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.siteBucket}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+    SiteOAC:
+      Type: AWS::CloudFront::OriginAccessControl
+      Properties:
+        OriginAccessControlConfig:
+          Name: ${self:service}-${self:provider.stage}-oac
+          OriginAccessControlOriginType: s3
+          SigningBehavior: always
+          SigningProtocol: sigv4
+
+    SiteDistribution:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Enabled: true
+          DefaultRootObject: index.html
+          Origins:
+            - Id: S3Site
+              DomainName: !GetAtt SiteBucket.RegionalDomainName
+              OriginAccessControlId: !GetAtt SiteOAC.Id
+              S3OriginConfig:
+                OriginAccessIdentity: ""
+            - Id: ApiOrigin
+              DomainName: !Sub "${HttpApi}.execute-api.${self:provider.region}.amazonaws.com"
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+          DefaultCacheBehavior:
+            TargetOriginId: S3Site
+            ViewerProtocolPolicy: redirect-to-https
+            # AWS managed policy "CachingOptimized"
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          CacheBehaviors:
+            - PathPattern: /api/*
+              TargetOriginId: ApiOrigin
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS]
+              # AWS managed policy "CachingDisabled"
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              # AWS managed policy "AllViewerExceptHostHeader"
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+    SiteBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref SiteBucket
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: cloudfront.amazonaws.com
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${self:custom.siteBucket}/*"
+              Condition:
+                StringEquals:
+                  AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+  Outputs:
+    IngestaoBucketName:
+      Value: ${self:custom.ingestaoBucket}
+    SorBucketName:
+      Value: ${self:custom.sorBucket}
+    SotBucketName:
+      Value: ${self:custom.sotBucket}
+    SiteUrl:
+      Description: URL publica da visualizacao (CloudFront)
+      Value: !Sub "https://${SiteDistribution.DomainName}"

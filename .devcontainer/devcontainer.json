@@ -1,0 +1,7 @@
+{
+  "name": "POC-DADOS-2",
+  "image": "robsondouglas/dev-lambda-node:1.0.4",
+  "remoteEnv": {
+    "AWS_REGION": "sa-east-1"
+  }
+}
