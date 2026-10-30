@@ -30,11 +30,11 @@ flowchart TD
     P[Produtor de arquivos] -->|PUT objeto| S3I[(S3 Ingestão)]
     S3I -->|s3:ObjectCreated| SNSI[SNS Ingestão]
     SNSI --> SQS[SQS Ingestão]
-    SQS -. falha apos 3 tentativas .-> DLQ[SQS DLQ]
+    SQS -. falha apos 3 tentativas .-> DLQ[SQS DLQ Ingestão]
     SQS --> LIN[Lambda Ingestão]
 
     LIN -->|put condicional controle + veiculos| DDB[(DynamoDB Single Table)]
-    LIN -->|cria schedule 30s por lote| SCH[EventBridge Scheduler]
+    LIN -->|SendMessage DelaySeconds=30 por lote| SLAQ[SQS SLA delay 30s]
 
     DDB -->|DynamoDB Stream filtro placa != 0000000| KDS[Kinesis Data Stream particao=lote]
     KDS --> LSOR[Lambda Consumidora SOR]
@@ -44,10 +44,10 @@ flowchart TD
     LIN -->|dispara carga| LSOT[Lambda Carga SOT]
     LSOT -->|ListObjectsV2 por lote| SOR
     LSOT -->|1 Parquet por lote| SOT[(S3 SOT)]
-    LSOT -->|CONCLUIDO + remove schedule| DDB
-    LSOT -->|remove| SCH
+    LSOT -->|CONCLUIDO| DDB
 
-    SCH -->|dispara apos 30s| LEXP[Lambda Expiração]
+    SLAQ -->|apos 30s| LEXP[Lambda Expiração]
+    SLAQ -. falha apos 3 tentativas .-> SDLQ[SQS DLQ SLA]
     LEXP -->|se PREENCHENDO -> EXPIRADO| DDB
 
     LSOT -->|SUCESSO| SNSR[SNS Resultado SLA]
@@ -58,13 +58,15 @@ flowchart TD
 Fluxo resumido:
 1. Um arquivo é depositado no bucket S3 de ingestão → notifica o SNS → entrega na SQS → aciona a **Lambda de Ingestão**.
 2. A Lambda parseia as linhas (descarte silencioso de malformadas), agrupa por lote e, para cada lote,
-   garante o registro de controle (condicional) e cria um schedule de 30s (SLA).
+   garante o registro de controle (condicional) e enfileira uma mensagem de SLA com `DelaySeconds=30`.
 3. Cada veículo é inserido de forma idempotente e incrementa atomicamente o contador do lote.
 4. O DynamoDB Stream propaga as inserções (exceto o registro de controle) para o Kinesis, particionado por lote.
 5. A **Lambda Consumidora SOR** grava 1 objeto por micro-batch na camada SOR (S3).
 6. Ao completar (`itens_registrados == lote_items`), o lote vira `PREENCHIDO` e dispara a **Lambda de Carga da SOT**,
-   que consolida a SOR em 1 Parquet por lote, marca `CONCLUIDO`, remove o schedule e notifica SUCESSO.
+   que consolida a SOR em 1 Parquet por lote, marca `CONCLUIDO` e notifica SUCESSO.
 7. Se o SLA de 30s estourar com o lote ainda em `PREENCHENDO`, a **Lambda de Expiração** marca `EXPIRADO` e notifica FALHA.
+   A mensagem de SLA é entregue mesmo que o lote já esteja `PREENCHIDO`/`CONCLUIDO`; nesse caso a transição condicional
+   falha e nada acontece (descarte barato).
 
 ## Ciclo de vida do status do lote
 
@@ -183,7 +185,7 @@ DynamoDB Stream → Kinesis Data Stream → Lambda Consumidora → SOR (S3) → 
 ├── requirements-dev.txt        # dependências de teste
 ├── pytest.ini
 ├── src/
-│   ├── common/                 # parsing, repository (DynamoDB), scheduler, constants
+│   ├── common/                 # parsing, repository (DynamoDB), sla_queue (SQS delay), constants
 │   ├── ingestao/               # Lambda de ingestão
 │   ├── sor_consumer/           # Lambda consumidora SOR (Kinesis -> S3)
 │   ├── carga_sot/              # Lambda de carga da SOT (SOR -> Parquet)
@@ -231,7 +233,8 @@ python -m pytest
 
 Cobrem: parser posicional, repositório DynamoDB (idempotência, contador atômico, transições e timestamps),
 ingestão (fluxo completo, reenvio idempotente, múltiplos lotes por arquivo), consumidora SOR, carga da SOT
-(sucesso, incompletude/retry, dedup), expiração (os três estados), scheduler (expressão one-time) e API.
+(sucesso, incompletude/retry, dedup), expiração (os três estados + evento SQS em lote), fila de SLA
+(mensagem com delay) e API.
 
 ## Como testar o fluxo
 
@@ -262,6 +265,14 @@ Arquivos de massa inclusos em `lotes/`:
   retry da carga e evitando expirar um lote cujos dados chegaram no prazo.
 - **PyArrow para escrever / DuckDB para ler**: cada ferramenta no seu ponto forte. A API baixa o Parquet para
   `/tmp` e lê localmente (evita dependência de `httpfs`/rede/home directory no Lambda).
+- **SLA via SQS com `DelaySeconds` (vs. EventBridge Scheduler)**: a ingestão envia 1 mensagem por lote com
+  `DelaySeconds=30`; após o atraso, a mensagem aciona a Lambda de Expiração. A SQS respeita o atraso com desvio
+  de poucos segundos, enquanto o schedule `at(...)` do Scheduler atrasa dezenas de segundos para intervalos
+  curtos — para um SLA de 30s, a precisão é muito melhor. Também elimina a role de invocação, a `Lambda::Permission`
+  e o grupo de schedules (justamente a complexidade de permissão que já causou falha silenciosa), e reaproveita
+  o padrão SQS + DLQ já usado na ingestão. A mensagem é sempre entregue, mesmo com o lote já `PREENCHIDO`/`CONCLUIDO`;
+  nesse caso a transição condicional (`status == PREENCHENDO`) falha de forma barata, sem efeito. Retry e dead-letter
+  são nativos da fila (`maxReceiveCount=3` → DLQ).
 
 ---
 

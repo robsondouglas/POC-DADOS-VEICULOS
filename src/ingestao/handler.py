@@ -3,7 +3,7 @@
 Fluxo (acionada por SQS, originada de SNS/S3):
   1. Para cada mensagem, extrai bucket/key do evento S3.
   2. Lê o arquivo, parseia as linhas (descarte silencioso de malformadas) e agrupa por lote.
-  3. Para cada lote: garante o registro de controle (condicional) e cria o schedule de SLA na criação.
+  3. Para cada lote: garante o registro de controle (condicional) e enfileira a verificação de SLA na criação.
   4. Insere cada veículo de forma idempotente e incrementa o contador atômico.
   5. Quando o lote completa, marca PREENCHIDO (passo único) e dispara a carga da SOT.
 """
@@ -17,7 +17,7 @@ import boto3
 
 from src.common.parsing import group_by_lote, parse_lines
 from src.common.repository import LoteRepository
-from src.common.scheduler import SchedulerClient
+from src.common.sla_queue import SlaQueueClient
 
 _s3 = None
 _lambda = None
@@ -69,7 +69,7 @@ def _trigger_sot_load(lote: str) -> None:
 
 def handler(event, context=None):
     repo = LoteRepository(os.environ["TABLE_NAME"])
-    scheduler = SchedulerClient()
+    sla_queue = SlaQueueClient()
 
     for bucket, key in _iter_s3_records(event):
         lines = _read_s3_lines(bucket, key)
@@ -79,7 +79,7 @@ def handler(event, context=None):
             lote_items = registros[0].lote_items
             control = repo.ensure_control(lote, lote_items)
             if control.created:
-                scheduler.create_sla_schedule(lote)
+                sla_queue.schedule_sla(lote)
 
             for record in registros:
                 result = repo.insert_vehicle(record)

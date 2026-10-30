@@ -52,9 +52,6 @@ def env(monkeypatch):
     monkeypatch.setenv("BUCKET_SOR", SOR)
     monkeypatch.setenv("BUCKET_SOT", SOT)
     monkeypatch.setenv("SNS_RESULTADO_ARN", "arn:aws:sns:us-east-1:123:topic")
-    monkeypatch.setenv("SCHEDULER_GROUP", "grp")
-    monkeypatch.setenv("SCHEDULER_TARGET_LAMBDA_ARN", "arn:lambda")
-    monkeypatch.setenv("SCHEDULER_ROLE_ARN", "arn:role")
 
 
 def test_carga_sot_sucesso(env):
@@ -77,13 +74,10 @@ def test_carga_sot_sucesso(env):
 
         import src.carga_sot.handler as h
 
-        with patch.object(h, "SchedulerClient") as sched_cls, patch.object(
-            h, "_sns_client"
-        ) as sns_fn:
+        with patch.object(h, "_sns_client") as sns_fn:
             out = h.handler({"lote": "000001"})
             assert out["veiculos"] == 2
             sns_fn.return_value.publish.assert_called_once()
-            sched_cls.return_value.delete_sla_schedule.assert_called_once_with("000001")
 
         # status concluído
         assert repo.get_status("000001") == Status.CONCLUIDO
@@ -120,7 +114,7 @@ def test_carga_sot_incompleta_levanta_para_retry(env):
 
         import src.carga_sot.handler as h
 
-        with patch.object(h, "SchedulerClient"), patch.object(h, "_sns_client"):
+        with patch.object(h, "_sns_client"):
             with pytest.raises(h.SorIncompleto):
                 h.handler({"lote": "000002"})
 
@@ -153,6 +147,6 @@ def test_carga_sot_dedup_por_placa(env):
 
         import src.carga_sot.handler as h
 
-        with patch.object(h, "SchedulerClient"), patch.object(h, "_sns_client"):
+        with patch.object(h, "_sns_client"):
             out = h.handler({"lote": "000003"})
             assert out["veiculos"] == 2

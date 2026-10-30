@@ -88,3 +88,37 @@ def test_nao_expira_quando_preenchido(env):
             assert out["expirado"] is False
             sns.publish.assert_not_called()
             assert repo.get_status("000003") == Status.PREENCHIDO
+
+
+def test_evento_sqs_em_lote(env):
+    """Caminho de produção: a Lambda consome mensagens da fila SLA (Records[].body)."""
+    import json
+
+    with mock_aws():
+        dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+        _create_table(dynamodb)
+        repo = LoteRepository(TABLE, dynamodb_resource=dynamodb)
+        repo.ensure_control("000010", 5)  # fica PREENCHENDO -> expira
+        repo.ensure_control("000011", 1)
+        repo.mark_preenchido("000011")
+        repo.mark_concluido("000011")  # CONCLUIDO -> não expira
+
+        import src.expiracao.handler as h
+
+        event = {
+            "Records": [
+                {"body": json.dumps({"lote": "000010"})},
+                {"body": json.dumps({"lote": "000011"})},
+            ]
+        }
+
+        with patch.object(h, "_sns_client") as sns_fn:
+            sns = sns_fn.return_value
+            out = h.handler(event)
+
+            resultados = {r["lote"]: r["expirado"] for r in out["resultados"]}
+            assert resultados == {"000010": True, "000011": False}
+            # Só o lote que expirou publica FALHA.
+            sns.publish.assert_called_once()
+            assert repo.get_status("000010") == Status.EXPIRADO
+            assert repo.get_status("000011") == Status.CONCLUIDO

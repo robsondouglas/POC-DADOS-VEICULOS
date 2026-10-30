@@ -63,8 +63,8 @@ o progresso e o status de preenchimento.
    SK=`0000000`, `lote_items` (vindo de LOTE-ITEMS), `itens_registrados=0` e `status='PREENCHENDO'`.
 2. O SISTEMA DEVE criar o registro de controle de forma condicional (`attribute_not_exists`) para não
    recriar um registro já existente quando o lote reaparecer.
-3. QUANDO o registro de controle de um lote for criado pela primeira vez, O SISTEMA DEVE criar um schedule
-   no EventBridge Scheduler de 30 segundos com ID igual ao do lote.
+3. QUANDO o registro de controle de um lote for criado pela primeira vez, O SISTEMA DEVE enfileirar uma
+   mensagem de SLA na SQS com `DelaySeconds=30` e corpo contendo o ID do lote.
 
 ### Requisito 4 — Inserção de veículos, idempotência e contagem
 **User story:** Como gestor de dados, quero que cada veículo seja inserido uma única vez por lote e que o
@@ -89,8 +89,9 @@ uma vez, para evitar processamento duplicado.
    registro de controle como `PREENCHIDO`, usando a condição `status = 'PREENCHENDO'` para garantir que
    apenas uma execução conduza a conclusão.
 2. QUANDO o lote for marcado como `PREENCHIDO`, O SISTEMA DEVE iniciar a carga da SOT.
-3. SE a carga da SOT for bem-sucedida, ENTÃO O SISTEMA DEVE marcar o registro de controle como `CONCLUIDO`
-   e remover o schedule do EventBridge referente ao lote.
+3. SE a carga da SOT for bem-sucedida, ENTÃO O SISTEMA DEVE marcar o registro de controle como `CONCLUIDO`.
+   (A mensagem de SLA pendente na SQS não é cancelada; será descartada pela Lambda de Expiração por falha
+   da transição condicional.)
 4. SE a carga da SOT falhar, ENTÃO O SISTEMA DEVE manter o status em `PREENCHIDO` para permitir nova tentativa,
    sem regredir de estado.
 
@@ -125,10 +126,10 @@ em um único arquivo Parquet por lote, para consumo eficiente.
 marcados como expirados, para visibilidade de descumprimento de SLA.
 
 #### Critérios de aceitação
-1. QUANDO o schedule de 30 segundos de um lote disparar, O SISTEMA DEVE acionar uma Lambda que verifica
-   o status do lote.
-2. SE o status do lote for `PREENCHENDO` no disparo do schedule, ENTÃO O SISTEMA DEVE marcar o lote como `EXPIRADO`.
-3. SE o status do lote já for `PREENCHIDO` ou `CONCLUIDO` no disparo do schedule, ENTÃO O SISTEMA NÃO DEVE
+1. QUANDO a mensagem de SLA de um lote ficar visível (após o `DelaySeconds=30`), O SISTEMA DEVE acionar
+   uma Lambda que verifica o status do lote.
+2. SE o status do lote for `PREENCHENDO` no consumo da mensagem, ENTÃO O SISTEMA DEVE marcar o lote como `EXPIRADO`.
+3. SE o status do lote já for `PREENCHIDO` ou `CONCLUIDO` no consumo da mensagem, ENTÃO O SISTEMA NÃO DEVE
    marcar o lote como `EXPIRADO`.
 4. QUANDO um lote expirar, O SISTEMA NÃO DEVE gerar SOT para esse lote, e os registros DEVEM ser removidos
    automaticamente pelo TTL de 1 dia do DynamoDB (sem exclusão ativa).

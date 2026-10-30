@@ -18,7 +18,7 @@ provider:
     BUCKET_SOT: ${self:custom.sotBucket}
     KINESIS_STREAM: ${self:custom.kinesisStream}
     SNS_RESULTADO_ARN: !Ref SnsResultadoSla
-    SCHEDULER_GROUP: ${self:custom.schedulerGroup}
+    SLA_QUEUE_URL: !Ref SlaQueue
 
 custom:
   # Stage em minúsculas para nomes de bucket S3 (não aceita maiúsculas).
@@ -30,7 +30,6 @@ custom:
   sotBucket: ${self:service}-${self:custom.bucketStage}-sot
   siteBucket: ${self:service}-${self:custom.bucketStage}-site
   kinesisStream: ${self:service}-${self:provider.stage}-stream
-  schedulerGroup: ${self:service}-${self:provider.stage}-sla
   pythonRequirements:
     dockerizePip: false
     slim: true
@@ -70,8 +69,6 @@ functions:
     handler: src/ingestao/handler.handler
     environment:
       CARGA_SOT_FUNCTION: ${self:service}-${self:provider.stage}-cargaSot
-      SCHEDULER_TARGET_LAMBDA_ARN: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${self:service}-${self:provider.stage}-expiracao"
-      SCHEDULER_ROLE_ARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/${self:service}-${self:provider.stage}-scheduler-invoke"
     layers:
       - Ref: PythonRequirementsLambdaLayer
     events:
@@ -91,12 +88,8 @@ functions:
         Resource: !Sub "arn:aws:s3:::${self:custom.ingestaoBucket}/*"
       - Effect: Allow
         Action:
-          - scheduler:CreateSchedule
-          - scheduler:DeleteSchedule
-        Resource: "*"
-      - Effect: Allow
-        Action: iam:PassRole
-        Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${self:service}-${self:provider.stage}-scheduler-invoke"
+          - sqs:SendMessage
+        Resource: !GetAtt SlaQueue.Arn
       - Effect: Allow
         Action: lambda:InvokeFunction
         Resource: !Sub "arn:aws:lambda:${self:provider.region}:*:function:${self:service}-${self:provider.stage}-cargaSot"
@@ -106,6 +99,10 @@ functions:
     name: ${self:service}-${self:provider.stage}-expiracao
     layers:
       - Ref: PythonRequirementsLambdaLayer
+    events:
+      - sqs:
+          arn: !GetAtt SlaQueue.Arn
+          batchSize: 10
     iamRoleStatements:
       - Effect: Allow
         Action:
@@ -177,10 +174,6 @@ functions:
         Action:
           - s3:PutObject
         Resource: !Sub "arn:aws:s3:::${self:custom.sotBucket}/*"
-      - Effect: Allow
-        Action:
-          - scheduler:DeleteSchedule
-        Resource: "*"
       - Effect: Allow
         Action: sns:Publish
         Resource: !Ref SnsResultadoSla
@@ -379,32 +372,29 @@ resources:
       Properties:
         TopicName: ${self:service}-${self:provider.stage}-resultado-sla
 
-    # ---------- IAM role usada pelo EventBridge Scheduler para invocar a Lambda de expiracao ----------
-    SchedulerInvokeRole:
-      Type: AWS::IAM::Role
+    # ---------- Fila de SLA (entrega atrasada) + DLQ ----------
+    # Substitui o EventBridge Scheduler: a ingestao envia 1 mensagem por lote
+    # com DelaySeconds=30; apos o atraso, a mensagem aciona a Lambda de Expiracao.
+    # Precisao do disparo muito melhor que o at(...) do Scheduler para 30s, e sem
+    # role de invocacao / Lambda::Permission.
+    SlaDLQ:
+      Type: AWS::SQS::Queue
       Properties:
-        RoleName: ${self:service}-${self:provider.stage}-scheduler-invoke
-        AssumeRolePolicyDocument:
-          Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Principal:
-                Service: scheduler.amazonaws.com
-              Action: sts:AssumeRole
-        Policies:
-          - PolicyName: InvokeExpiracaoLambda
-            PolicyDocument:
-              Version: "2012-10-17"
-              Statement:
-                - Effect: Allow
-                  Action: lambda:InvokeFunction
-                  Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${self:service}-${self:provider.stage}-expiracao"
+        QueueName: ${self:service}-${self:provider.stage}-sla-dlq
+        MessageRetentionPeriod: 1209600 # 14 dias
 
-    # ---------- Scheduler Group dedicado ----------
-    SlaSchedulerGroup:
-      Type: AWS::Scheduler::ScheduleGroup
+    SlaQueue:
+      Type: AWS::SQS::Queue
       Properties:
-        Name: ${self:custom.schedulerGroup}
+        QueueName: ${self:service}-${self:provider.stage}-sla
+        # >= timeout da Lambda de expiracao (default 30s) para evitar reentrega
+        # prematura durante o processamento.
+        VisibilityTimeout: 180
+        # DelaySeconds e definido por mensagem no SendMessage (SLA_SECONDS),
+        # nao aqui, para que o atraso conte a partir da criacao do controle.
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt SlaDLQ.Arn
+          maxReceiveCount: 3
 
     # ---------- Visualizacao: site estatico + CloudFront ----------
     SiteBucket:

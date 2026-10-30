@@ -3,7 +3,7 @@
 ## Stack e convenções
 
 - **IaC:** Serverless Framework (`serverless.yml`). Recursos AWS nativos (buckets S3, SNS, SQS+DLQ,
-  DynamoDB, Kinesis, EventBridge Scheduler) declarados no bloco `resources` (CloudFormation);
+  DynamoDB, Kinesis) declarados no bloco `resources` (CloudFormation);
   as Lambdas no bloco `functions`.
 - **Runtime das Lambdas:** Python (`python3.12`). Dependências empacotadas via
   `serverless-python-requirements` (com `dockerizePip` para compilar libs nativas como `pyarrow`).
@@ -32,7 +32,7 @@ O sistema ingere arquivos posicionais do S3, grava cada veículo em uma tabela D
 mantendo um registro de controle por lote, e materializa os dados de lotes completos em uma camada analítica
 (SOT) em Parquet. O caminho analítico é desacoplado da tabela OLTP por meio de DynamoDB Stream → Kinesis →
 camada SOR (S3), evitando leituras onerosas no DynamoDB para lotes grandes. Um SLA de 30s por lote é
-controlado via EventBridge Scheduler, e o resultado (sucesso/falha) é notificado por SNS.
+controlado via SQS com entrega atrasada (`DelaySeconds`), e o resultado (sucesso/falha) é notificado por SNS.
 
 ## Arquitetura
 
@@ -41,11 +41,11 @@ flowchart TD
     P[Produtor de arquivos] -->|PUT objeto| S3I[(S3 Ingestão)]
     S3I -->|s3:ObjectCreated| SNSI[SNS Ingestão]
     SNSI --> SQS[SQS Ingestão]
-    SQS -. falha apos 3 tentativas .-> DLQ[SQS DLQ]
+    SQS -. falha apos 3 tentativas .-> DLQ[SQS DLQ Ingestão]
     SQS --> LIN[Lambda Ingestão]
 
     LIN -->|put condicional controle + veiculos| DDB[(DynamoDB Single Table)]
-    LIN -->|cria schedule 30s por lote| SCH[EventBridge Scheduler]
+    LIN -->|SendMessage DelaySeconds=30 por lote| SLAQ[SQS SLA delay 30s]
 
     DDB -->|DynamoDB Stream filtro placa != 0000000| KDS[Kinesis Data Stream particao=lote]
     KDS --> LSOR[Lambda Consumidora SOR]
@@ -55,10 +55,10 @@ flowchart TD
     LIN -->|dispara carga| LSOT[Lambda Carga SOT]
     LSOT -->|ListObjectsV2 por lote| SOR
     LSOT -->|1 Parquet por lote| SOT[(S3 SOT)]
-    LSOT -->|CONCLUIDO + remove schedule| DDB
-    LSOT -->|remove| SCH
+    LSOT -->|CONCLUIDO| DDB
 
-    SCH -->|dispara apos 30s| LEXP[Lambda Expiração]
+    SLAQ -->|apos 30s| LEXP[Lambda Expiração]
+    SLAQ -. falha apos 3 tentativas .-> SDLQ[SQS DLQ SLA]
     LEXP -->|se PREENCHENDO -> EXPIRADO| DDB
 
     LSOT -->|SUCESSO| SNSR[SNS Resultado SLA]
@@ -92,7 +92,7 @@ para cada (lote, linhas) em por_lote:
         ttl=now+1d,
         cond=attribute_not_exists(PK) AND attribute_not_exists(SK))
     se criou:
-        criar_schedule(id=lote, delay=30s)     # EventBridge Scheduler
+        enfileirar_sla(lote, delay=30s)        # SQS SendMessage DelaySeconds=30
 
     para cada linha em linhas:
         inserido = put_item_condicional(
@@ -148,13 +148,17 @@ Exemplo de itens:
 - `ListObjectsV2` em `sor/lote=<LOTE>/`, lê e consolida os registros de veículos.
 - Valida `count(registros) == lote_items` antes de materializar (trata a consistência eventual da SOR).
 - Grava `sot/lote=<LOTE>/dados.parquet` com colunas `lote, placa, ano_fabricacao, modelo, fabricante`.
-- Em sucesso: marca `CONCLUIDO`, remove o schedule e publica SUCESSO no SNS de resultado.
+- Em sucesso: marca `CONCLUIDO` e publica SUCESSO no SNS de resultado.
 - Em falha: mantém `PREENCHIDO` (permite retry).
 
-### EventBridge Scheduler + Lambda Expiração
-- Um schedule one-time de 30s por lote, ID = lote.
-- No disparo, a Lambda Expiração lê o status: se `PREENCHENDO` → `EXPIRADO` + publica FALHA no SNS;
-  se `PREENCHIDO`/`CONCLUIDO` → não faz nada.
+### SQS SLA (entrega atrasada) + Lambda Expiração
+- A ingestão envia 1 mensagem por lote com `DelaySeconds=30` ao criar o registro de controle.
+- Após o atraso, a mensagem fica visível e é consumida (event source mapping) pela Lambda Expiração.
+- A Lambda lê o status: se `PREENCHENDO` → `EXPIRADO` + publica FALHA no SNS;
+  se `PREENCHIDO`/`CONCLUIDO`/inexistente → não faz nada (transição condicional falha de forma barata).
+- A mensagem não é cancelada na conclusão do lote (a SQS não permite apagar mensagem com delay pendente);
+  ela é simplesmente descartada pela Lambda quando o status já não é `PREENCHENDO`.
+- DLQ com `maxReceiveCount=3` captura falhas de processamento, tornando-as observáveis.
 
 ### SNS Resultado SLA
 - SUCESSO (lote CONCLUIDO): ponto de integração para a infra downstream consumir a SOT.

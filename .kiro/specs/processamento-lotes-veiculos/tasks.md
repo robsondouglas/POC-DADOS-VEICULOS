@@ -35,8 +35,8 @@
 - [x] 5.1 Leitura do arquivo e agrupamento por lote
   - Ler bucket/key da mensagem SQS, baixar o arquivo, parsear e agrupar linhas por lote.
   - _Requisitos: 1.3, 2.2_
-- [x] 5.2 Criação condicional do registro de controle e schedule
-  - Put condicional (`attribute_not_exists`) do controle com status PREENCHENDO; criar schedule de 30s (ID=lote) só na criação.
+- [x] 5.2 Criação condicional do registro de controle e enfileiramento de SLA
+  - Put condicional (`attribute_not_exists`) do controle com status PREENCHENDO; enfileirar mensagem SLA na SQS com `DelaySeconds=30` (corpo=lote) só na criação.
   - _Requisitos: 3.1, 3.2, 3.3_
 - [x] 5.3 Inserção idempotente de veículos e contagem atômica
   - Put condicional do veículo; em sucesso, `ADD itens_registrados 1` com `UPDATED_NEW`.
@@ -66,14 +66,14 @@
   - Gravar `sot/lote=<LOTE>/dados.parquet` com as colunas definidas, usando `pyarrow` (ou `awswrangler`).
   - _Requisitos: 7.2, 7.3_
 - [x] 8.3 Finalização de estado e notificação de sucesso
-  - Em sucesso: marcar CONCLUIDO, remover schedule e publicar SUCESSO no SNS.
+  - Em sucesso: marcar CONCLUIDO e publicar SUCESSO no SNS.
   - Em falha: manter PREENCHIDO para retry.
   - _Requisitos: 5.3, 5.4, 9.1_
 
 - [x] 9. Implementar a Lambda de Expiração (SLA)
-  - Acionada pelo schedule; marcar EXPIRADO somente se status == PREENCHENDO; publicar FALHA no SNS.
+  - Acionada pela fila SLA (event source SQS); marcar EXPIRADO somente se status == PREENCHENDO; publicar FALHA no SNS.
   - Não marcar se já PREENCHIDO/CONCLUIDO. Confiar no TTL para limpeza.
-  - Escrever testes cobrindo os três estados no disparo.
+  - Escrever testes cobrindo os três estados e o consumo de evento SQS em lote.
   - _Requisitos: 8.1, 8.2, 8.3, 8.4, 9.2_
 
 - [x] 10. Criar o SNS de resultado de SLA e integrações

@@ -1,4 +1,4 @@
-"""Testes da Lambda de ingestão com moto (S3 + DynamoDB) e stubs de scheduler/lambda."""
+"""Testes da Lambda de ingestão com moto (S3 + DynamoDB) e stubs de fila SLA/lambda."""
 import json
 from unittest.mock import patch
 
@@ -42,9 +42,7 @@ def _sqs_event(bucket, key):
 def env(monkeypatch):
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     monkeypatch.setenv("TABLE_NAME", TABLE)
-    monkeypatch.setenv("SCHEDULER_GROUP", "grp")
-    monkeypatch.setenv("SCHEDULER_TARGET_LAMBDA_ARN", "arn:lambda")
-    monkeypatch.setenv("SCHEDULER_ROLE_ARN", "arn:role")
+    monkeypatch.setenv("SLA_QUEUE_URL", "https://sqs/x/sla")
     monkeypatch.setenv("CARGA_SOT_FUNCTION", "carga-sot")
 
 
@@ -70,15 +68,15 @@ def test_ingestao_fluxo_completo(env):
 
         import src.ingestao.handler as h
 
-        with patch.object(h, "SchedulerClient") as sched_cls, patch.object(
+        with patch.object(h, "SlaQueueClient") as sched_cls, patch.object(
             h, "_lambda_client"
         ) as lambda_fn:
             sched = sched_cls.return_value
             lambda_client = lambda_fn.return_value
             h.handler(_sqs_event(BUCKET, "arquivo1.txt"))
 
-            # schedule criado uma vez (lote novo)
-            sched.create_sla_schedule.assert_called_once_with("000001")
+            # SLA enfileirado uma vez (lote novo)
+            sched.schedule_sla.assert_called_once_with("000001")
             # carga da SOT disparada ao completar (2/2)
             lambda_client.invoke.assert_called_once()
             _, kwargs = lambda_client.invoke.call_args
@@ -103,7 +101,7 @@ def test_ingestao_idempotente_em_reenvio(env):
 
         import src.ingestao.handler as h
 
-        with patch.object(h, "SchedulerClient"), patch.object(h, "_lambda_client"):
+        with patch.object(h, "SlaQueueClient"), patch.object(h, "_lambda_client"):
             # processa o mesmo arquivo duas vezes
             h.handler(_sqs_event(BUCKET, "dup.txt"))
             h.handler(_sqs_event(BUCKET, "dup.txt"))
@@ -131,13 +129,13 @@ def test_ingestao_multiplos_lotes_no_mesmo_arquivo(env):
 
         import src.ingestao.handler as h
 
-        with patch.object(h, "SchedulerClient") as sched_cls, patch.object(
+        with patch.object(h, "SlaQueueClient") as sched_cls, patch.object(
             h, "_lambda_client"
         ):
             sched = sched_cls.return_value
             h.handler(_sqs_event(BUCKET, "multi.txt"))
-            # dois lotes novos -> dois schedules
-            assert sched.create_sla_schedule.call_count == 2
+            # dois lotes novos -> dois SLAs enfileirados
+            assert sched.schedule_sla.call_count == 2
 
         repo = LoteRepository(TABLE, dynamodb_resource=dynamodb)
         # lote 000010 completou (1/1); 000011 ainda não (1/2)

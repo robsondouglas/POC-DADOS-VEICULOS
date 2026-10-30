@@ -7,7 +7,11 @@ Passos:
   2. Valida que a contagem consolidada == lote_items (trata consistência eventual da SOR).
      Se faltar registro, levanta exceção para retry (mantém status PREENCHIDO).
   3. Escreve 1 arquivo Parquet por lote na SOT (via pyarrow).
-  4. Marca CONCLUIDO, remove o schedule e publica SUCESSO no SNS.
+  4. Marca CONCLUIDO e publica SUCESSO no SNS.
+
+Observação: a mensagem de SLA na fila não é cancelada na conclusão (a SQS não
+permite apagar mensagem com delay pendente). Ela será entregue à Lambda de
+Expiração, que a descartará porque o status já não é PREENCHENDO.
 """
 from __future__ import annotations
 
@@ -21,7 +25,6 @@ import pyarrow.parquet as pq
 
 from src.common.constants import SOT_COLUMNS
 from src.common.repository import LoteRepository
-from src.common.scheduler import SchedulerClient
 
 _s3 = None
 _sns = None
@@ -108,7 +111,6 @@ def handler(event, context=None):
     key = _write_parquet(sot_bucket, lote, vehicles)
 
     repo.mark_concluido(lote)
-    SchedulerClient().delete_sla_schedule(lote)
     _publish_sucesso(lote, key)
 
     return {"lote": lote, "veiculos": len(vehicles), "sot_key": key}
